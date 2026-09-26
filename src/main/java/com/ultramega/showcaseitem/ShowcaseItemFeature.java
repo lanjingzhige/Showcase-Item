@@ -5,6 +5,8 @@ import com.ultramega.showcaseitem.network.ShareItemData;
 
 import java.util.List;
 
+import javax.annotation.Nullable;
+
 import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
@@ -21,6 +23,7 @@ import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.chat.Style;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.FormattedCharSequence;
+import net.minecraft.util.FormattedCharSink;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.inventory.Slot;
@@ -39,6 +42,24 @@ import net.neoforged.neoforge.network.PacketDistributor;
 public class ShowcaseItemFeature {
     public static float alphaValue = 1F;
 
+    /**
+     * The item is rendered at half size, so it occupies {@value #ICON_SIZE} pixels of a chat line.
+     */
+    private static final float ICON_SCALE = 0.5F;
+    private static final float ICON_SIZE = 16.0F * ICON_SCALE;
+
+    /**
+     * The item marker is a run of spaces that precedes the item name, see {@link #createStackComponent}.
+     */
+    private static final int MARKER_MIN_SPACES = 2;
+
+    /**
+     * When a message is wrapped, the line break eats the space it breaks at, so the line before the item name
+     * can end with the leftover of the marker. That leftover still needs one space more than a complete marker
+     * to be a marker of its own, otherwise the icon belongs to the item name on the next line.
+     */
+    private static final int MARKER_TRAILING_MIN_SPACES = MARKER_MIN_SPACES + 1;
+
     private static long lastShadeTimestamp = -1;
 
     @OnlyIn(Dist.CLIENT)
@@ -46,21 +67,76 @@ public class ShowcaseItemFeature {
         if (!Config.renderItemsInChat)
             return;
 
-        Minecraft mc = Minecraft.getInstance();
+        ItemMarkerSink sink = new ItemMarkerSink(guiGraphics, x, y, color);
+        if (sequence.accept(sink)) {
+            //the item name can be wrapped onto the next line, leaving the marker at the end of this one
+            sink.renderTrailingMarker();
+        }
+    }
 
-        StringBuilder before = new StringBuilder();
+    /**
+     * Looks for the marker that precedes the name of a shared item and renders the item icon on top of it.
+     */
+    @OnlyIn(Dist.CLIENT)
+    private static final class ItemMarkerSink implements FormattedCharSink {
+        private final Minecraft mc;
+        private final GuiGraphics guiGraphics;
+        private final float x;
+        private final float y;
+        private final int color;
+        private final StringBuilder text = new StringBuilder();
 
-        int halfSpace = mc.font.width(" ") / 2;
+        private Style spaceStyle;
+        private boolean rendered;
 
-        sequence.accept((counter_, style, character) -> {
-            String sofar = before.toString();
-            if (sofar.endsWith("  ")) {
-                render(mc, guiGraphics, sofar.substring(0, sofar.length() - 2), character == ' ' ? 0 : -halfSpace, x, y, style, color);
+        private ItemMarkerSink(GuiGraphics guiGraphics, float x, float y, int color) {
+            this.mc = Minecraft.getInstance();
+            this.guiGraphics = guiGraphics;
+            this.x = x;
+            this.y = y;
+            this.color = color;
+        }
+
+        @Override
+        public boolean accept(int position, Style style, int character) {
+            if (character == ' ') {
+                this.spaceStyle = style;
+                this.text.append(' ');
+                return true;
+            }
+
+            int markerSpaces = this.countMarkerSpaces();
+            if (markerSpaces >= MARKER_MIN_SPACES) {
+                this.renderItem(style, this.spaceStyle, markerSpaces);
                 return false;
             }
-            before.append((char) character);
+
+            this.text.appendCodePoint(character);
             return true;
-        });
+        }
+
+        private void renderTrailingMarker() {
+            int markerSpaces = this.countMarkerSpaces();
+            if (markerSpaces >= MARKER_TRAILING_MIN_SPACES) {
+                this.renderItem(this.spaceStyle, this.spaceStyle, markerSpaces);
+            }
+        }
+
+        private int countMarkerSpaces() {
+            int spaces = 0;
+            for (int i = this.text.length() - 1; i >= 0 && this.text.charAt(i) == ' '; i--) {
+                spaces++;
+            }
+            return spaces;
+        }
+
+        private void renderItem(Style style, Style markerStyle, int markerSpaces) {
+            if (this.rendered)
+                return;
+
+            this.rendered = true;
+            render(this.mc, this.guiGraphics, this.text.substring(0, this.text.length() - markerSpaces), markerSpaces, this.x, this.y, style, markerStyle, this.color);
+        }
     }
 
     @SubscribeEvent
@@ -117,8 +193,8 @@ public class ShowcaseItemFeature {
             }
             if (!stack.isEmpty()) {
                 MutableComponent message = Component
-                    .translatable("showcaseitem.misc.shared_item", player.getName())
-                    .append(stack.getDisplayName());
+                        .translatable("showcaseitem.misc.shared_item", player.getName())
+                        .append(stack.getDisplayName());
 
                 player.server.getPlayerList().getPlayers().forEach(p -> p.sendSystemMessage(message));
             }
@@ -143,11 +219,14 @@ public class ShowcaseItemFeature {
     }
 
     @OnlyIn(Dist.CLIENT)
-    private static void render(Minecraft mc, GuiGraphics graphics, String before, float extraShift, float x, float y, Style style, int color) {
+    private static void render(Minecraft mc, GuiGraphics graphics, String before, int markerSpaces, float x, float y, Style style, Style markerStyle, int color) {
         float a = (color >> 24 & 255) / 255.0F;
 
-        HoverEvent hoverEvent = style.getHoverEvent();
-        if (hoverEvent != null && hoverEvent.getAction() == HoverEvent.Action.SHOW_ITEM) {
+        HoverEvent hoverEvent = itemHoverEvent(style.getHoverEvent());
+        if (hoverEvent == null && markerStyle != null) {
+            hoverEvent = itemHoverEvent(markerStyle.getHoverEvent());
+        }
+        if (hoverEvent != null) {
             HoverEvent.ItemStackInfo contents = hoverEvent.getValue(HoverEvent.Action.SHOW_ITEM);
 
             ItemStack stack = contents != null ? contents.getItemStack() : ItemStack.EMPTY;
@@ -155,7 +234,10 @@ public class ShowcaseItemFeature {
             if (stack.isEmpty())
                 stack = new ItemStack(Blocks.BARRIER); // For invalid icon
 
-            float shift = mc.font.width(before) + extraShift;
+            //center the icon in the space that the marker reserved for it, so it lines up no matter
+            //how many spaces the marker consists of (messages that got wrapped use less of them)
+            float markerWidth = mc.font.width(" ") * markerSpaces;
+            float shift = mc.font.width(before) + (markerWidth - ICON_SIZE) / 2.0F;
 
             // Fix y-shift if overflowingbars is installed
             if (ModList.get().isLoaded("overflowingbars")) {
@@ -172,8 +254,8 @@ public class ShowcaseItemFeature {
                 PoseStack pose = graphics.pose();
                 pose.pushPose();
 
-                pose.translate(shift + x + (mc.font.width("  ")) / 2.0f, y, 0);
-                pose.scale(0.5f, 0.5f, 0.5f);
+                pose.translate(shift + x, y, 0);
+                pose.scale(ICON_SCALE, ICON_SCALE, ICON_SCALE);
 
                 graphics.renderItem(stack, 0, 0);
 
@@ -184,6 +266,11 @@ public class ShowcaseItemFeature {
                 alphaValue = 1F;
             }
         }
+    }
+
+    @Nullable
+    private static HoverEvent itemHoverEvent(@Nullable HoverEvent hoverEvent) {
+        return hoverEvent != null && hoverEvent.getAction() == HoverEvent.Action.SHOW_ITEM ? hoverEvent : null;
     }
 
     private static boolean keyModifierPressed(Minecraft mc) {
